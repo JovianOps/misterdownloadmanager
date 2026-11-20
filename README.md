@@ -1,5 +1,14 @@
 # Mister Download Manager
+<p align="center">
+  <a href="https://github.com/anefzaoui/misterdownloadmanager">
+    <img src="https://img.shields.io/badge/Fork%20of-anefzaoui%2Fmisterdownloadmanager-0ea5e9?style=for-the-badge&logo=github" alt="Fork of anefzaoui/misterdownloadmanager">
+  </a>
+  <img src="https://img.shields.io/badge/Rust-2024%20Edition-ea580c?style=for-the-badge&logo=rust&logoColor=white" alt="Rust 2024 Edition">
+  <img src="https://img.shields.io/badge/License-GPL--3.0-22c55e?style=for-the-badge" alt="GPL-3.0 License">
+</p>
 
+> [!NOTE]
+> **JovianOps Edition** — Active fork of [`anefzaoui/misterdownloadmanager`](https://github.com/anefzaoui/misterdownloadmanager) focused on enhanced drag-and-drop workflows and additional usability features.
 <p align="center">
   <img src="docs/images/logo.png" alt="Mister Download Manager's logo" width="160">
 </p>
