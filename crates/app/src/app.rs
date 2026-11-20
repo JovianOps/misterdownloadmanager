@@ -11068,12 +11068,6 @@ impl App {
     /// link or a .torrent file goes the usual way (Download File Info, Add torrent); several
     /// addresses, or a list file (.txt, .ef2, .htm, .csv), show in Import to tick first.
     fn dropped(&mut self, items: Vec<String>, ctx: &egui::Context) {
-        // Windows Internet Shortcuts dragged from the desktop are files, not OLE URL drags.
-        // Resolve them here so they join the same path as links dragged from a browser.
-        let items = items
-            .into_iter()
-            .map(|item| shortcut_url(std::path::Path::new(&item)).unwrap_or(item))
-            .collect::<Vec<_>>();
         let list_file = |s: &str| {
             let p = std::path::Path::new(s);
             p.is_file()
@@ -12709,54 +12703,6 @@ impl App {
             }
         }
         self.summaries = keep;
-    }
-}
-
-/// The download address stored in a Windows Internet Shortcut (`.url`) file.
-fn shortcut_url(path: &std::path::Path) -> Option<String> {
-    if !path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("url"))
-    {
-        return None;
-    }
-    let text = std::fs::read_to_string(path).ok()?;
-    let url = text
-        .trim_start_matches('\u{feff}')
-        .lines()
-        .filter_map(|line| line.trim().split_once('='))
-        .find_map(|(key, value)| key.eq_ignore_ascii_case("URL").then(|| value.trim()))?;
-    url::Url::parse(url)
-        .ok()
-        .filter(mdm_engine::supported)
-        .map(|_| url.to_owned())
-}
-
-#[cfg(test)]
-mod shortcut_url_tests {
-    use super::shortcut_url;
-
-    #[test]
-    fn reads_only_supported_urls_from_internet_shortcut_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let shortcut = dir.path().join("download.URL");
-        std::fs::write(
-            &shortcut,
-            "\u{feff}[InternetShortcut]\r\nURL=https://example.com/file.zip\r\n",
-        )
-        .unwrap();
-        assert_eq!(
-            shortcut_url(&shortcut).as_deref(),
-            Some("https://example.com/file.zip")
-        );
-
-        std::fs::write(&shortcut, "[InternetShortcut]\nURL=file:///secret\n").unwrap();
-        assert_eq!(
-            shortcut_url(&shortcut),
-            None,
-            "unsupported schemes are ignored"
-        );
-        assert_eq!(shortcut_url(&dir.path().join("download.txt")), None);
     }
 }
 
