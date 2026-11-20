@@ -1,9 +1,5 @@
 # Mister Download Manager
 <p align="center">
-  <img src="art/jovianops-mdm-banner.svg" alt="Mister Download Manager — JovianOps Edition" width="100%">
-</p>
-
-<p align="center">
   <a href="https://github.com/anefzaoui/misterdownloadmanager">
     <img src="https://img.shields.io/badge/Fork%20of-anefzaoui%2Fmisterdownloadmanager-0ea5e9?style=for-the-badge&logo=github" alt="Fork of anefzaoui/misterdownloadmanager">
   </a>
