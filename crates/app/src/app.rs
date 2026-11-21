@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -1282,6 +1283,18 @@ enum Branch {
     Queues,
 }
 
+/// A newer helper for a failing download: found and ready, none, or why it couldn't be looked for.
+type HealSlot = Arc<Mutex<Option<Result<Option<mdm_tools::Installed>, String>>>>;
+
+/// A failing download's helper being brought up to date (#1544, [`App::heal_if_outdated`]).
+struct Healing {
+    tool: mdm_tools::autoupdate::Tool,
+    /// The newer version found and ready, none, or why it couldn't be looked for.
+    slot: HealSlot,
+    /// The download's error as it failed, put back when nothing newer is found.
+    error: Option<String>,
+}
+
 pub struct App {
     rt: tokio::runtime::Handle,
     items: Vec<Item>,
@@ -1617,6 +1630,15 @@ pub struct App {
     queues: Vec<Queue>,
     /// Failure time and count per download, for queue retries.
     failures: HashMap<u64, (Instant, u32)>,
+    /// MDM's own helpers kept up to date while it runs (#1544).
+    keeper: crate::helpers::Keeper,
+    /// Videos and galleries that failed with words meaning their helper is out of date (#1544):
+    /// a newer one being looked for, then the download tried again once ([`Healing`]).
+    healing: HashMap<u64, Healing>,
+    /// The downloads started again after that: a second such failure stands.
+    heal_retry: std::collections::HashSet<u64>,
+    /// The yt-dlp or gallery-dl version each video or gallery last started with.
+    started_with: HashMap<u64, String>,
     /// Stopped by hand while they could have run: a running queue leaves them alone until
     /// they are started again or the queue is started anew (#341).
     stopped_by_hand: std::collections::HashSet<u64>,
@@ -2002,12 +2024,15 @@ impl App {
                 crate::win32::update_run_at_startup();
             }
         }
+        // Linux and macOS: an entry naming a program that's gone (this one's path before an
+        // upgrade replaced it while it ran, an AppImage moved) is written again first; then the
+        // option says whether the entry is on and starts this very program (#1484).
         #[cfg(unix)]
         {
-            settings.launch_on_startup = crate::unix::run_at_startup();
-            if settings.launch_on_startup && mdm_ipc::portable_dir().is_none() {
+            if mdm_ipc::portable_dir().is_none() {
                 crate::unix::update_run_at_startup();
             }
+            settings.launch_on_startup = crate::unix::run_at_startup();
         }
         // Browser integration: a registration that leads nowhere is repaired (#818); Linux and
         // macOS, which have no installer step, register with each browser here too.
@@ -2293,6 +2318,10 @@ impl App {
             last_layout: None,
             queues,
             failures: HashMap::new(),
+            keeper: Default::default(),
+            healing: HashMap::new(),
+            heal_retry: Default::default(),
+            started_with: HashMap::new(),
             stopped_by_hand: Default::default(),
             saved_by_hand: Default::default(),
             clock: None,
@@ -3215,14 +3244,21 @@ impl App {
     /// command does. Unknown names do nothing.
     fn show_named(&mut self, name: &str, ctx: &egui::Context) {
         // MDM_CRASH_TEST=1 only (crash.rs): a stall in a later tick of the window hidden in the
-        // notification area (#1126), which this hides rather than shows.
+        // notification area (#1126), which this hides rather than shows; or of the window
+        // minimized to the taskbar (#1481), which this minimizes (as its title bar's button does).
         if crate::crash::testing()
             && let Some(test) = name.strip_prefix("crash-test:")
-            && test.starts_with("hidden-")
         {
-            self.hide_to_tray(ctx);
-            crate::crash::test(test);
-            return;
+            if test.starts_with("hidden-") {
+                self.hide_to_tray(ctx);
+                crate::crash::test(test);
+                return;
+            }
+            if test.starts_with("minimized-") {
+                crate::dialogs::minimize(ctx, self.main_hwnd);
+                crate::crash::test(test);
+                return;
+            }
         }
         self.show_window(ctx);
         let first = self.items.first().map(|i| i.id);
@@ -3388,6 +3424,11 @@ impl App {
             "speedlimit" => self.run(Cmd::LimiterSettings, None, ctx),
             "properties" if first.is_some() => self.run(Cmd::Properties, first, ctx),
             "delete" if first.is_some() => self.run(Cmd::Remove, first, ctx),
+            // Remove with files on every download (screenshots: the finished files it counts).
+            "delete-files" => {
+                let all = self.items.iter().map(|i| i.id).collect();
+                self.ask_delete(all, true);
+            }
             // Redownload of the first download, its question answered Yes (checks of a slow disk:
             // the window never waits for its old files to go).
             "redownload" => {
@@ -4322,6 +4363,7 @@ impl App {
     fn stop(&mut self, id: u64) {
         // A video waiting for its place doesn't start.
         self.video_places.unwait(id);
+        self.stop_healing(id);
         if let Some(l) = self.item(id).and_then(|i| i.live.as_ref()) {
             l.dl.cancel();
         }
@@ -4341,6 +4383,7 @@ impl App {
     fn halt(&mut self, id: u64) {
         // A video waiting for its place doesn't start.
         self.video_places.unwait(id);
+        self.stop_healing(id);
         // Every other download stops here as `stop` stops it.
         if let Some(l) = self.item(id).and_then(|i| i.live.as_ref()) {
             let before = l.dl.live_state();
@@ -4503,33 +4546,46 @@ impl App {
         doomed
     }
 
-    /// Delete / Remove / Delete All Completed: asks first (unless "Don't show this dialog
-    /// again" was ticked) whether only the list entries go or the files too; `files` ticks that
-    /// box (Shift+Delete). Running downloads are left alone.
+    /// Delete / Remove / Delete All Completed: asks first whether only the list entries go or
+    /// the files too. The box starts unticked every time; `files` ticks it for this once
+    /// (Shift+Delete, Remove with files). With "Don't show this dialog again" ticked, a plain
+    /// Delete only takes the downloads off the list, never their files; Shift+Delete still asks,
+    /// as nothing leaves the disk unasked (#1563). Running downloads are left alone.
     fn ask_delete(&mut self, ids: Vec<u64>, files: bool) {
         let gone: Vec<&Item> = ids
             .iter()
             .filter_map(|id| self.items.iter().find(|i| i.id == *id && i.live.is_none()))
             .collect();
         let Some(first) = gone.first() else { return };
-        // Shift+Delete ticks "also the files" this once; only a plain Delete's answer is
-        // remembered (else one Shift+Delete made every later Delete erase files).
-        let shift = files;
-        let files = files || self.settings.delete_files_too;
-        if self.settings.confirm_delete {
+        if self.settings.confirm_delete || files {
             let one = gone.len() == 1;
-            let mut ask = dialogs::ConfirmDelete::new(
+            // A finished file goes with a ticked box: the window says how many (#1563).
+            let finished = gone
+                .iter()
+                .filter(|i| i.status == Status::Complete && i.gallery.is_none())
+                .count() as u64;
+            self.confirm_delete = Some(dialogs::ConfirmDelete::new(
                 gone.iter().map(|i| i.id).collect(),
                 first.file_name.clone(),
                 one && first.status != Status::Complete,
                 files,
-            );
-            ask.remember = !shift;
-            self.confirm_delete = Some(ask);
+                finished,
+            ));
         } else {
             let ids: Vec<u64> = gone.into_iter().map(|i| i.id).collect();
-            self.remove_downloads(&ids, files);
+            self.remove_downloads(&ids, false);
         }
+    }
+
+    /// The delete question answered Yes: the downloads go, with their files if its box was
+    /// ticked this time (never remembered, #1563); "Don't show this dialog again" turns the
+    /// question off.
+    fn confirmed_delete(&mut self, ids: &[u64], files: bool, dont_show: bool) {
+        self.remove_downloads(ids, files);
+        if dont_show {
+            self.settings.confirm_delete = false;
+        }
+        self.dirty = true;
     }
 
     fn delete_completed(&mut self) {
@@ -5730,7 +5786,6 @@ impl App {
     /// to is the Video category's folder, the Music category's while a sound-only choice is
     /// chosen (#611; not when the user deleted Music).
     fn video_dialog(&self, page: Option<(&str, mdm_ipc::Command)>) -> crate::videodlg::VideoDialog {
-        crate::videodlg::refresh_ytdlp(&self.rt);
         let dir = self.settings.category_dir(Category::Video, &self.downloads);
         let music = (!Category::Music.deleted())
             .then(|| self.settings.category_dir(Category::Music, &self.downloads));
@@ -5832,7 +5887,6 @@ impl App {
         }
         let now = Instant::now();
         if let Some(ask) = &cmd.video_lookup {
-            crate::videodlg::refresh_ytdlp(&self.rt);
             let Some(tool) = mdm_tools::tools_dir()
                 .as_deref()
                 .and_then(mdm_tools::installed)
@@ -5968,7 +6022,15 @@ impl App {
             return;
         }
         let tools = mdm_tools::tools_dir();
-        let tool = tools.as_deref().and_then(mdm_tools::installed);
+        // Tried again for a newer yt-dlp (#1544): that one, even while other downloads keep the
+        // switch to it waiting.
+        let retry = self.heal_retry.contains(&id);
+        let tool = tools.as_deref().and_then(|d| {
+            retry
+                .then(|| mdm_tools::autoupdate::ready(d, mdm_tools::autoupdate::Tool::YtDlp))
+                .flatten()
+                .or_else(|| mdm_tools::installed(d))
+        });
         let ffmpeg = tools.as_deref().and_then(mdm_tools::ffmpeg::installed);
         let rate = self.helper_starts(id);
         // The engine downloads the streams with what a file from the page gets (#769): Options'
@@ -6055,6 +6117,10 @@ impl App {
                 });
             }
         }
+        // The version it runs with, for a failure that means it is out of date (#1544).
+        if self.items.iter().any(|i| i.id == id && i.live.is_some()) {
+            self.started_with.insert(id, tool.version.clone());
+        }
         self.dirty = true;
         if show && !self.progress.iter().any(|p| p.id == id) {
             self.progress
@@ -6093,9 +6159,14 @@ impl App {
 
     /// Start (or start again) a gallery: gallery-dl, installed and verified, or the person's.
     fn start_gallery(&mut self, id: u64, show: bool) {
-        let tool = mdm_tools::tools_dir()
-            .as_deref()
-            .and_then(mdm_tools::gallery::installed);
+        // Tried again for a newer gallery-dl (#1544): that one.
+        let retry = self.heal_retry.contains(&id);
+        let tool = mdm_tools::tools_dir().as_deref().and_then(|d| {
+            retry
+                .then(|| mdm_tools::autoupdate::ready(d, mdm_tools::autoupdate::Tool::GalleryDl))
+                .flatten()
+                .or_else(|| mdm_tools::gallery::installed(d))
+        });
         let rate = self.helper_starts(id);
         // The engine downloads the files gallery-dl lists (#769), as a file from the page would
         // be (Options' connections, proxy, network adapter, DNS, the limit for all downloads),
@@ -6158,6 +6229,10 @@ impl App {
                 item.status = Status::Error;
                 item.error = Some(e.to_string());
             }
+        }
+        // The version it runs with, for a failure that means it is out of date (#1544).
+        if self.items.iter().any(|i| i.id == id && i.live.is_some()) {
+            self.started_with.insert(id, tool.version.clone());
         }
         self.dirty = true;
         if show && !self.progress.iter().any(|p| p.id == id) {
@@ -7847,8 +7922,9 @@ impl App {
 
     fn member_of(&self, i: &Item, now: Instant) -> Member {
         let id = i.id;
-        // A video waiting for its place to start (videoplace.rs) runs, for its queue.
-        if self.video_places.waiting(id) {
+        // A video waiting for its place to start (videoplace.rs) runs, for its queue, and so does
+        // one waiting for a newer helper (#1544).
+        if self.video_places.waiting(id) || self.healing.contains_key(&id) {
             return Member::Running;
         }
         match i.status {
@@ -8596,6 +8672,12 @@ impl App {
             }
             any_live |= i.live.is_some();
         }
+        // A video or gallery whose helper seems out of date: a newer one first (#1544).
+        failed.retain(|id| !self.heal_if_outdated(*id, ctx));
+        failed.extend(self.healed(ctx));
+        for id in &finished {
+            self.heal_retry.remove(id);
+        }
         let now = Instant::now();
         self.check_limits(now);
         if !finished.is_empty() {
@@ -8721,6 +8803,142 @@ impl App {
         }
     }
 
+    /// A video or gallery that just failed with words that usually mean its helper (MDM's own
+    /// yt-dlp or gallery-dl) is out of date (#1544, `mdm_tools::autoupdate::outdated`): a newer one
+    /// is looked for at once, in the background, the download waiting as running meanwhile, its
+    /// log saying so ([`App::healed`] goes on). Once per start: the start that follows fails as
+    /// any other. Returns whether it waits.
+    fn heal_if_outdated(&mut self, id: u64, ctx: &egui::Context) -> bool {
+        use mdm_tools::autoupdate::{self as au, Tool};
+        if self.heal_retry.remove(&id) || self.healing.contains_key(&id) {
+            return false;
+        }
+        let Some(dir) = mdm_tools::tools_dir() else {
+            return false;
+        };
+        let Some(item) = self.items.iter().find(|i| i.id == id) else {
+            return false;
+        };
+        let tool = if item.video.is_some() {
+            Tool::YtDlp
+        } else if item.gallery.is_some() {
+            Tool::GalleryDl
+        } else {
+            return false;
+        };
+        // The helper's own words (English), not the row's translated ones.
+        let said = item
+            .snap
+            .as_ref()
+            .and_then(|s| s.error.clone())
+            .or_else(|| item.error.clone())
+            .unwrap_or_default();
+        if !au::outdated(tool, &said) || !au::read(&dir).auto {
+            return false;
+        }
+        let Some(own) = au::own(&dir, tool) else {
+            return false; // the person's own program, or the system's: theirs to update
+        };
+        let used = self.started_with.get(&id).cloned().unwrap_or(own.version);
+        let slot: HealSlot = Arc::default();
+        let (out, wake) = (slot.clone(), ctx.clone());
+        let net = crate::settings::own_net();
+        let used_now = used.clone();
+        self.rt.spawn(async move {
+            let res = au::heal(&dir, tool, &used_now, &net, au::unix_now()).await;
+            *out.lock().unwrap() = Some(res.map_err(|e| crate::errors::tools(&e)));
+            wake.request_repaint();
+        });
+        let Some(item) = self.item(id) else {
+            return false;
+        };
+        tracing::info!(
+            "download {id}: {} {used} may be out of date for it: looking for a newer one",
+            tool.name()
+        );
+        item.note(crate::i18n::fmt(
+            // i18n: a video's or gallery's log: it failed in a way that usually means yt-dlp (or gallery-dl) is out of date with the site; {name} = yt-dlp or gallery-dl, {version} = the version used
+            crate::i18n::t(
+                "{name} {version} may be out of date for this site: looking for a newer version",
+            ),
+            &[("name", tool.name()), ("version", &used)],
+        ));
+        let error = item.error.take();
+        item.status = Status::Downloading;
+        self.healing.insert(id, Healing { tool, slot, error });
+        self.dirty = true;
+        true
+    }
+
+    /// The downloads whose newer helper was looked for (#1544): started again with it when one
+    /// was found, else failed as they did (returned, for the failures' bookkeeping). A download
+    /// stopped or removed meanwhile is left as it is.
+    fn healed(&mut self, ctx: &egui::Context) -> Vec<u64> {
+        let done: Vec<(u64, Result<Option<mdm_tools::Installed>, String>)> = self
+            .healing
+            .iter()
+            .filter_map(|(id, h)| h.slot.lock().unwrap().take().map(|r| (*id, r)))
+            .collect();
+        if !self.healing.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+        let mut failed = Vec::new();
+        for (id, res) in done {
+            let Some(h) = self.healing.remove(&id) else {
+                continue;
+            };
+            let name = h.tool.name();
+            let Some(item) = self.item(id) else {
+                continue;
+            };
+            if item.live.is_some() || item.status != Status::Downloading {
+                continue;
+            }
+            match res {
+                Ok(Some(newer)) => {
+                    item.note(crate::i18n::fmt(
+                        // i18n: a video's or gallery's log: a newer yt-dlp (or gallery-dl) is in, and the download starts again with it; {name} = yt-dlp or gallery-dl, {version} = the new version
+                        crate::i18n::t("{name} {version} is in: trying again with it"),
+                        &[("name", name), ("version", &newer.version)],
+                    ));
+                    tracing::info!("download {id}: trying again with {name} {}", newer.version);
+                    self.heal_retry.insert(id);
+                    self.start(id, false);
+                }
+                other => {
+                    item.note(match other {
+                        Err(why) => crate::i18n::fmt(
+                            // i18n: a video's or gallery's log: MDM couldn't look for a newer yt-dlp (or gallery-dl); {name} = its name, {error} = why
+                            crate::i18n::t("Couldn't look for a newer {name}: {error}"),
+                            &[("name", name), ("error", &why)],
+                        ),
+                        _ => crate::i18n::fmt(
+                            // i18n: a video's or gallery's log: MDM looked for a newer yt-dlp (or gallery-dl) and the one it has is the newest; {name} = its name
+                            crate::i18n::t("No newer {name} than this one"),
+                            &[("name", name)],
+                        ),
+                    });
+                    item.status = Status::Error;
+                    item.error = h.error;
+                    failed.push(id);
+                }
+            }
+            self.dirty = true;
+        }
+        failed
+    }
+
+    /// Stopped while a newer helper was being looked for (#1544): it stays stopped.
+    fn stop_healing(&mut self, id: u64) {
+        if self.healing.remove(&id).is_some()
+            && let Some(item) = self.item(id)
+            && item.live.is_none()
+        {
+            item.status = Status::Stopped;
+            self.dirty = true;
+        }
+    }
+
     /// A finished download's progress window closes, and Download complete opens for it (`early`:
     /// the download Download File Info started early, which stays quiet).
     fn close_finished(&mut self, id: u64, early: Option<u64>) {
@@ -8765,7 +8983,11 @@ impl App {
         running: &std::collections::HashSet<u64>,
     ) -> crate::finish::Standing {
         use crate::finish::Standing;
-        if i.live.is_some() || i.status == Status::Downloading || self.quota.held.contains(&i.id) {
+        if i.live.is_some()
+            || i.status == Status::Downloading
+            || self.quota.held.contains(&i.id)
+            || self.healing.contains_key(&i.id)
+        {
             return Standing::Pending;
         }
         match i.status {
@@ -12009,16 +12231,8 @@ impl App {
                 Outcome::Closed => self.confirm_delete = None,
                 Outcome::Done((files, dont_show)) => {
                     let ids = std::mem::take(&mut d.ids);
-                    let remember = d.remember;
                     self.confirm_delete = None;
-                    self.remove_downloads(&ids, files);
-                    if remember {
-                        self.settings.delete_files_too = files;
-                    }
-                    if dont_show {
-                        self.settings.confirm_delete = false;
-                    }
-                    self.dirty = true;
+                    self.confirmed_delete(&ids, files, dont_show);
                 }
             }
         }
@@ -12783,6 +12997,21 @@ fn alt_alone_released(events: &[egui::Event], down: &mut bool, alone: &mut bool)
     released
 }
 
+/// Whether the main window is minimized now (to the taskbar, the Dock, the window list). egui's
+/// window state says so on Windows and X11, read afresh each frame. macOS's isn't read again
+/// while running (egui#3494) and keeps the last minimize MDM asked for, even after a click on the
+/// Dock brought the window back: AppKit is asked instead. Wayland tells no program its window is
+/// minimized (xdg-shell has no such state): false there, as egui says.
+fn main_minimized(ctx: &egui::Context) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = ctx;
+        crate::unix::macos_window_miniaturized(crate::MAIN_TITLE).unwrap_or(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    ctx.input(|i| i.viewport().minimized == Some(true))
+}
+
 impl eframe::App for App {
     /// What comes in from outside (a second launch, the browser's native host, the automation
     /// API) is handled here, which runs at every frame: `ui` doesn't run while the main window
@@ -12808,9 +13037,12 @@ impl App {
         // The freeze watchdog times this as it times `ui` (crash.rs): a command or the clock
         // that hangs is reported too, minimized or not (#202).
         crate::crash::logic_begin();
-        // Whether a stall now could be seen: every window of MDM's hidden (the main window in
-        // the notification area, no other window open) is felt by nobody (#1126).
-        crate::crash::hidden(self.hidden && ctx.input(|i| i.raw.viewports.len() <= 1));
+        // Whether a stall now could be seen: every window of MDM's out of sight (the main window
+        // in the notification area or minimized to the taskbar, no other window open) is felt by
+        // nobody (#1126, #1481).
+        let windows = ctx.input(|i| i.raw.viewports.len());
+        let minimized = !self.hidden && windows <= 1 && main_minimized(ctx);
+        crate::crash::hidden(crate::crash::out_of_sight(self.hidden, minimized, windows));
         crate::crash::armed();
         crate::crash::step(crate::crash::Step::Commands);
         let mut handled = false;
@@ -12846,9 +13078,13 @@ impl App {
         // runs no `ui`, and the queues, the Scheduler's starts and stops, the download limits,
         // the kill switch, saving the list, the clipboard monitor, the update check, the tray and
         // the taskbar's progress all stood still until the window was restored.
+        if self.settings.follows_system() {
+            crate::pacfetch::watch_system(&self.rt);
+        }
         crate::settings::share_proxy(self.settings.proxy());
         crate::settings::share_dns(self.settings.dns());
         crate::settings::share_video_settings(&self.settings);
+        crate::extractq::share_chosen_7zip(&self.settings.seven_zip_path);
         if !self.headless {
             crate::crash::step(crate::crash::Step::Accessibility);
             self.follow_assistive_technology(ctx);
@@ -12872,6 +13108,9 @@ impl App {
         }
         crate::crash::step(crate::crash::Step::Limits);
         self.apply_global_limit();
+        // MDM's own helpers kept up to date (#1544), a server's too (its image doesn't hold them).
+        crate::crash::step(crate::crash::Step::UpdateCheck);
+        self.keeper.tick(&self.rt, self.started, Some(ctx));
         // A server (#157) has no screen, clipboard or tray, and is updated by its image.
         if !self.headless {
             crate::crash::step(crate::crash::Step::UpdateCheck);
@@ -16527,5 +16766,137 @@ mod fresh_address_tests {
         );
         assert_eq!(get(&app, 1).url, old);
         assert!(get(&app, 1).private_window);
+    }
+}
+
+/// #1563: "Also delete the files from disk" is never remembered, and nothing leaves the disk
+/// without the question: a list from 0.5.2 that remembered the box ticked, with the question
+/// turned off, deleted finished files with every Delete All Completed.
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// An App over `items` with the settings a 0.5.2 list saved: the box remembered ticked, the
+    /// question on or off.
+    fn app_from_052(items: Vec<Item>, confirm: bool) -> std::mem::ManuallyDrop<App> {
+        let rt = Box::leak(Box::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        ));
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "confirm_delete": confirm,
+            "delete_files_too": true,
+        }))
+        .unwrap();
+        let loaded = store::Loaded {
+            next_id: 100,
+            items,
+            columns: None,
+            settings,
+            queues: Vec::new(),
+        };
+        let (_, commands) = std::sync::mpsc::channel();
+        // Never dropped: an App saves its list as it goes.
+        std::mem::ManuallyDrop::new(App::assemble(
+            &egui::Context::default(),
+            rt.handle().clone(),
+            commands,
+            loaded,
+            crate::Start::Shown,
+        ))
+    }
+
+    /// Two finished downloads and a stopped one, each with its file on the disk.
+    fn three(dir: &Path) -> (Vec<Item>, [PathBuf; 3]) {
+        let paths = ["a.bin", "b.bin", "c.bin"].map(|n| dir.join(n));
+        let items = paths
+            .iter()
+            .zip([Status::Complete, Status::Complete, Status::Stopped])
+            .enumerate()
+            .map(|(n, (dest, status))| {
+                std::fs::write(dest, b"finished").unwrap();
+                let name = dest.file_name().unwrap().to_string_lossy().into_owned();
+                let url = url::Url::parse(&format!("http://127.0.0.1:9/{name}")).unwrap();
+                let mut i = Item::new(n as u64 + 1, url, dest.clone(), Category::General);
+                i.status = status;
+                i
+            })
+            .collect();
+        (items, paths)
+    }
+
+    fn ids(app: &App) -> Vec<u64> {
+        app.items.iter().map(|i| i.id).collect()
+    }
+
+    fn asked(app: &App) -> &dialogs::ConfirmDelete {
+        app.confirm_delete.as_ref().expect("the question is shown")
+    }
+
+    #[test]
+    fn without_the_question_deleting_only_takes_rows_off_the_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let (items, files) = three(dir.path());
+        let mut app = app_from_052(items, false);
+        let ctx = egui::Context::default();
+        app.run(Cmd::DeleteCompleted, None, &ctx);
+        assert!(app.confirm_delete.is_none(), "not asked");
+        assert_eq!(ids(&app), [3], "the finished rows went");
+        app.run(Cmd::Remove, Some(3), &ctx);
+        assert!(app.confirm_delete.is_none());
+        assert!(app.items.is_empty());
+        assert!(app.deleter.finish(Duration::from_secs(10)));
+        for f in &files {
+            assert!(f.exists(), "{} kept", f.display());
+        }
+    }
+
+    #[test]
+    fn the_box_starts_unticked_and_a_tick_is_not_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let (items, files) = three(dir.path());
+        let mut app = app_from_052(items, true);
+        let ctx = egui::Context::default();
+        app.run(Cmd::DeleteCompleted, None, &ctx);
+        let ask = asked(&app);
+        assert!(!ask.files, "Delete All Completed starts unticked");
+        assert_eq!((ask.ids.clone(), ask.finished), (vec![1, 2], 2));
+        // Yes with the box ticked this time: those files go.
+        let chosen = app.confirm_delete.take().unwrap().ids;
+        app.confirmed_delete(&chosen, true, false);
+        assert!(app.deleter.finish(Duration::from_secs(10)));
+        assert!(!files[0].exists() && !files[1].exists());
+        // The next Delete starts unticked again.
+        app.run(Cmd::Remove, Some(3), &ctx);
+        assert!(!asked(&app).files, "the tick was not remembered");
+        app.confirm_delete = None;
+        assert!(files[2].exists());
+    }
+
+    #[test]
+    fn remove_with_files_asks_even_without_the_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let (items, files) = three(dir.path());
+        let mut app = app_from_052(items, false);
+        let ctx = egui::Context::default();
+        app.selection.set_many(&[1, 2, 3]);
+        app.run(Cmd::RemoveWithFiles, None, &ctx);
+        let ask = asked(&app);
+        assert!(ask.files, "Shift+Delete ticks it, this once");
+        assert_eq!(ask.ids, [1, 2, 3]);
+        assert_eq!(ask.finished, 2, "the window counts the finished files");
+        assert_eq!(app.items.len(), 3, "nothing gone before Yes");
+        app.confirm_delete = None; // No
+        // Its tick is not remembered either: a plain Delete after it asks nothing and keeps
+        // the file.
+        app.selection.set(1);
+        app.run(Cmd::Remove, None, &ctx);
+        assert!(app.confirm_delete.is_none());
+        assert_eq!(ids(&app), [2, 3]);
+        assert!(app.deleter.finish(Duration::from_secs(10)));
+        assert!(files.iter().all(|f| f.exists()));
     }
 }
